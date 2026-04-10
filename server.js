@@ -10,6 +10,10 @@ const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
+
+// Trust proxy is required for express-rate-limit to work correctly on platforms like Render/Heroku
+app.set('trust proxy', 1);
+
 app.use(express.json());
 
 // --- PHASE 5: SECURITY HARDENING ---
@@ -133,10 +137,7 @@ app.post('/admin/login', async (req, res) => {
         if (admin.isBanned) return res.status(403).json({ success: false, message: 'Admin account is banned' });
 
         admin.lastLoginAt = new Date();
-        await User.updateOne(
-            { _id: user._id },
-            { $set: { lastLoginAt: new Date() } }
-        );
+        await admin.save();
 
         const token = jwt.sign(
             { adminId: admin._id.toString(), role: admin.role, type: 'admin' },
