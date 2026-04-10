@@ -165,7 +165,10 @@ app.post('/api/auth/login', async (req, res) => {
         }
 
         user.lastLoginAt = new Date();
-        await user.save();
+        await User.updateOne(
+            { _id: user._id },
+            { $set: { lastLoginAt: new Date() } }
+        );
 
         const token = jwt.sign(
             { userId: user._id, role: user.role },
