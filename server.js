@@ -44,7 +44,7 @@ function isValidEmail(email) {
 }
 
 function isValidPassword(password) {
-    return typeof password === 'string' && password.length >= 8 && password.length <= 128;
+    return typeof password === 'string' && password.length >= 6 && password.length <= 128;
 }
 
 function sanitizePagination(value, fallback, max) {
