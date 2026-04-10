@@ -133,7 +133,10 @@ app.post('/admin/login', async (req, res) => {
         if (admin.isBanned) return res.status(403).json({ success: false, message: 'Admin account is banned' });
 
         admin.lastLoginAt = new Date();
-        await admin.save();
+        await User.updateOne(
+            { _id: user._id },
+            { $set: { lastLoginAt: new Date() } }
+        );
 
         const token = jwt.sign(
             { adminId: admin._id.toString(), role: admin.role, type: 'admin' },
