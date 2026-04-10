@@ -10,19 +10,11 @@ const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
-
-// Trust proxy is required for express-rate-limit to work correctly on platforms like Render/Heroku
 app.set('trust proxy', 1);
-
 app.use(express.json());
 
 // --- PHASE 5: SECURITY HARDENING ---
-app.use(helmet({
-    contentSecurityPolicy: false,
-}));
-
-// Serve static files from the 'public' directory
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(helmet());
 
 const apiLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -36,14 +28,17 @@ const ADMIN_TOKEN_TTL = process.env.ADMIN_TOKEN_TTL || '8h';
 
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100,
+    max: 60,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, message: 'Too many admin requests' }
 });
 app.use('/admin', adminLimiter);
+app.use('/admin', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+});
 
-// --- HELPER FUNCTIONS ---
 function isValidEmail(email) {
     return typeof email === 'string' && email.includes('@') && email.length <= 254;
 }
@@ -53,8 +48,8 @@ function isValidPassword(password) {
 }
 
 function sanitizePagination(value, fallback, max) {
-    const parsed = parseInt(value, 10);
-    if (isNaN(parsed) || parsed <= 0) return fallback;
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isNaN(parsed) || parsed <= 0) return fallback;
     return Math.min(parsed, max);
 }
 
@@ -70,7 +65,7 @@ mongoose.connect(process.env.MONGO_URI)
 // --- MONGODB MODELS ---
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true, trim: true },
-    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     role: { type: String, enum: ['user', 'admin'], default: 'user', index: true },
     isBanned: { type: Boolean, default: false, index: true },
@@ -82,26 +77,92 @@ const UserSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', UserSchema);
 
-const MessageSchema = new mongoose.Schema({
-    from: { type: String, required: true, trim: true },
-    to: { type: String, required: true, trim: true },
-    payload: { type: String, required: true },
-    timestamp: { type: Number, required: true }
-}, { versionKey: false });
+const MessageSchema = new mongoose.Schema(
+    {
+        from: { type: String, required: true, trim: true },
+        to: { type: String, required: true, trim: true },
+        message: { type: String, required: true },
+        timestamp: { type: Number, required: true }
+    },
+    { versionKey: false }
+);
 MessageSchema.index({ from: 1, to: 1, timestamp: 1 });
 const Message = mongoose.model('Message', MessageSchema);
 
-// --- AUTH MIDDLEWARE ---
+// --- AUTH ROUTES ---
+app.post('/api/auth/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        if (!isValidEmail(email)) return res.status(400).json({ success: false, message: 'Invalid email' });
+        if (!username || username.trim().length < 3) {
+            return res.status(400).json({ success: false, message: 'Invalid username' });
+        }
+        if (!isValidPassword(password)) {
+            return res.status(400).json({ success: false, message: 'Password must be 8-128 chars' });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 12);
+        const user = new User({ username: username.trim(), email, password: hashedPassword });
+        await user.save();
+        const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET);
+        res.status(201).json({
+            success: true,
+            message: 'User registered',
+            token,
+            user: { id: user._id, username: user.username, email: user.email, role: user.role }
+        });
+    } catch (e) {
+        res.status(400).json({ success: false, message: 'Username or email already exists' });
+    }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        if (!isValidEmail(email) || !isValidPassword(password)) {
+            return res.status(400).json({ success: false, message: 'Invalid credentials format' });
+        }
+        const user = await User.findOne({ email });
+        if (!user || !await bcrypt.compare(password, user.password)) {
+            return res.status(401).json({ success: false, message: 'Invalid credentials' });
+        }
+        if (user.isBanned) {
+            return res.status(403).json({ success: false, message: 'Account is banned' });
+        }
+        user.lastLoginAt = new Date();
+        await user.save();
+        const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET);
+        res.json({
+            success: true,
+            message: 'Login successful',
+            token,
+            user: { id: user._id, username: user.username, email: user.email, role: user.role }
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 function extractBearerToken(req) {
     const auth = req.headers.authorization || '';
     if (!auth.startsWith('Bearer ')) return null;
     return auth.slice(7).trim();
 }
 
+function signAdminToken(adminUser) {
+    return jwt.sign(
+        { adminId: adminUser._id.toString(), role: adminUser.role, type: 'admin' },
+        ADMIN_JWT_SECRET,
+        { expiresIn: ADMIN_TOKEN_TTL }
+    );
+}
+
 async function verifyAdminToken(req, res, next) {
     try {
         const token = extractBearerToken(req);
-        if (!token) return res.status(401).json({ success: false, message: 'Missing admin token' });
+        if (!token) {
+            return res.status(401).json({ success: false, message: 'Missing admin token' });
+        }
 
         const payload = jwt.verify(token, ADMIN_JWT_SECRET);
         if (payload.type !== 'admin' || payload.role !== 'admin') {
@@ -114,204 +175,359 @@ async function verifyAdminToken(req, res, next) {
         }
 
         req.admin = admin;
-        next();
+        return next();
     } catch (error) {
         return res.status(401).json({ success: false, message: 'Invalid or expired admin token' });
     }
 }
 
-// --- ADMIN ROUTES ---
-
-app.get('/admin', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
-
 app.post('/admin/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        const safeEmail = typeof email === 'string' ? email.toLowerCase().trim() : '';
-        const admin = await User.findOne({ email: safeEmail, role: 'admin' });
+        if (!isValidEmail(email) || !isValidPassword(password)) {
+            return res.status(400).json({ success: false, message: 'Invalid credentials format' });
+        }
+
+        const admin = await User.findOne({ email, role: 'admin' });
         if (!admin || !await bcrypt.compare(password, admin.password)) {
             return res.status(401).json({ success: false, message: 'Invalid admin credentials' });
         }
-        if (admin.isBanned) return res.status(403).json({ success: false, message: 'Admin account is banned' });
+        if (admin.isBanned) {
+            return res.status(403).json({ success: false, message: 'Admin account is banned' });
+        }
 
         admin.lastLoginAt = new Date();
         await admin.save();
 
-        const token = jwt.sign(
-            { adminId: admin._id.toString(), role: admin.role, type: 'admin' },
-            ADMIN_JWT_SECRET,
-            { expiresIn: ADMIN_TOKEN_TTL }
-        );
-        res.json({ success: true, token, admin: { id: admin._id, username: admin.username, email: admin.email, role: admin.role } });
+        const token = signAdminToken(admin);
+        return res.json({
+            success: true,
+            token,
+            admin: { id: admin._id, username: admin.username, email: admin.email, role: admin.role }
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Admin login failed' });
+        return res.status(500).json({ success: false, message: 'Admin login failed' });
     }
 });
 
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+const clients = new Map();
+const socketToUserId = new Map();
+const adminMonitors = new Set();
+const connectionLogs = [];
+
+function pushConnectionLog(event, userId, extra = {}) {
+    connectionLogs.push({
+        event,
+        userId,
+        timestamp: Date.now(),
+        ...extra
+    });
+    if (connectionLogs.length > 500) {
+        connectionLogs.splice(0, connectionLogs.length - 500);
+    }
+}
+
+function broadcastMonitorSnapshot() {
+    if (!adminMonitors.size) return;
+    const payload = JSON.stringify({
+        type: 'monitor_snapshot',
+        connectedUsers: Array.from(clients.keys()),
+        activeConnections: clients.size,
+        connectionLogs: connectionLogs.slice(-50)
+    });
+
+    for (const ws of adminMonitors) {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(payload);
+        }
+    }
+}
+
+const getConversationMessages = async (req, res) => {
+    try {
+        const user1 = (req.query.user1 || '').trim();
+        const user2 = (req.query.user2 || '').trim();
+
+        if (!user1 || !user2) {
+            return res.status(400).json({
+                success: false,
+                message: 'user1 and user2 are required query params'
+            });
+        }
+
+        const messages = await Message.find({
+            $or: [
+                { from: user1, to: user2 },
+                { from: user2, to: user1 }
+            ]
+        })
+            .sort({ timestamp: 1 })
+            .select('from to message timestamp -_id')
+            .lean();
+
+        return res.json(messages);
+    } catch (error) {
+        console.error('GET /messages failed:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to fetch messages'
+        });
+    }
+};
+
+const saveMessage = async (req, res) => {
+    try {
+        const from = (req.body.from || '').trim();
+        const to = (req.body.to || '').trim();
+        const message = typeof req.body.message === 'string' ? req.body.message : '';
+        const timestamp = Number(req.body.timestamp);
+
+        if (!from || !to || !message || Number.isNaN(timestamp)) {
+            return res.status(400).json({
+                success: false,
+                message: 'from, to, message and numeric timestamp are required'
+            });
+        }
+
+        await Message.create({ from, to, message, timestamp });
+        return res.status(201).json({ success: true });
+    } catch (error) {
+        console.error('POST /messages failed:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to store message'
+        });
+    }
+};
+
+app.get('/messages', getConversationMessages);
+app.get('/api/messages', getConversationMessages);
+app.post('/messages', saveMessage);
+app.post('/api/messages', saveMessage);
+
 app.get('/admin/dashboard', verifyAdminToken, async (req, res) => {
     try {
-        const [totalUsers, bannedUsers, messagesCount] = await Promise.all([
+        const [totalUsers, bannedUsers, adminUsers, messagesCount] = await Promise.all([
             User.countDocuments(),
             User.countDocuments({ isBanned: true }),
+            User.countDocuments({ role: 'admin' }),
             Message.countDocuments()
         ]);
+
         const last24h = Date.now() - 24 * 60 * 60 * 1000;
         const messagesLast24h = await Message.countDocuments({ timestamp: { $gte: last24h } });
 
-        res.json({
+        return res.json({
             success: true,
             data: {
                 totalUsers,
                 bannedUsers,
+                adminUsers,
                 activeUsers: clients.size,
+                connectedUsers: Array.from(clients.keys()),
                 messagesCount,
                 messagesLast24h,
-                uptimeSeconds: Math.floor(process.uptime())
+                uptimeSeconds: Math.floor(process.uptime()),
+                serverTime: Date.now(),
+                status: 'ok'
             }
         });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to load dashboard' });
+        return res.status(500).json({ success: false, message: 'Failed to load dashboard' });
     }
 });
 
 app.get('/admin/users', verifyAdminToken, async (req, res) => {
     try {
-        const { q, role, banned } = req.query;
+        const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+        const role = typeof req.query.role === 'string' ? req.query.role.trim() : '';
+        const banned = typeof req.query.banned === 'string' ? req.query.banned.trim() : '';
+        const page = sanitizePagination(req.query.page, 1, 100000);
         const limit = sanitizePagination(req.query.limit, 20, 100);
-        const filter = {};
-        if (q) filter.$or = [{ username: { $regex: q, $options: 'i' } }, { email: { $regex: q, $options: 'i' } }];
-        if (role) filter.role = role;
-        if (banned === 'true') filter.isBanned = true;
-        if (banned === 'false') filter.isBanned = false;
+        const skip = (page - 1) * limit;
 
-        const users = await User.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
-        res.json({ success: true, data: { users } });
+        const filter = {};
+        if (q) {
+            filter.$or = [
+                { username: { $regex: q, $options: 'i' } },
+                { email: { $regex: q, $options: 'i' } }
+            ];
+        }
+        if (role === 'admin' || role === 'user') {
+            filter.role = role;
+        }
+        if (banned === 'true' || banned === 'false') {
+            filter.isBanned = banned === 'true';
+        }
+
+        const [users, total] = await Promise.all([
+            User.find(filter)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .select('_id username email role isBanned bannedAt bannedReason lastLoginAt createdAt')
+                .lean(),
+            User.countDocuments(filter)
+        ]);
+
+        return res.json({ success: true, data: { users, page, limit, total } });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to load users' });
+        return res.status(500).json({ success: false, message: 'Failed to load users' });
     }
 });
 
 app.patch('/admin/users/:id/ban', verifyAdminToken, async (req, res) => {
     try {
-        const { banned, reason } = req.body;
-        const user = await User.findById(req.params.id);
+        const { id } = req.params;
+        if (!isValidObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+        const banned = Boolean(req.body.banned);
+        const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 200) : null;
+
+        const user = await User.findById(id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-        if (user.role === 'admin') return res.status(400).json({ success: false, message: 'Cannot ban an admin' });
+        if (user.role === 'admin' && user._id.toString() === req.admin._id.toString()) {
+            return res.status(400).json({ success: false, message: 'Cannot ban your own admin account' });
+        }
 
         user.isBanned = banned;
         user.bannedAt = banned ? new Date() : null;
         user.bannedReason = banned ? reason : null;
         await user.save();
-        res.json({ success: true });
+
+        return res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Ban action failed' });
+        return res.status(500).json({ success: false, message: 'Failed to update ban state' });
     }
 });
 
 app.post('/admin/users/:id/reset-password', verifyAdminToken, async (req, res) => {
     try {
-        const { newPassword } = req.body;
-        if (!isValidPassword(newPassword)) return res.status(400).json({ success: false, message: 'Invalid password' });
-        const user = await User.findById(req.params.id);
+        const { id } = req.params;
+        if (!isValidObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+        const newPassword = req.body.newPassword;
+        if (!isValidPassword(newPassword)) {
+            return res.status(400).json({ success: false, message: 'Password must be 8-128 chars' });
+        }
+
+        const user = await User.findById(id);
         if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
         user.password = await bcrypt.hash(newPassword, 12);
         await user.save();
-        res.json({ success: true });
+        return res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Reset failed' });
+        return res.status(500).json({ success: false, message: 'Failed to reset password' });
     }
 });
 
 app.delete('/admin/users/:id', verifyAdminToken, async (req, res) => {
     try {
-        const user = await User.findById(req.params.id);
-        if (!user || user.role === 'admin') return res.status(400).json({ success: false, message: 'Cannot delete' });
-        await User.deleteOne({ _id: req.params.id });
-        res.json({ success: true });
+        const { id } = req.params;
+        if (!isValidObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+        const user = await User.findById(id);
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        if (user.role === 'admin' && user._id.toString() === req.admin._id.toString()) {
+            return res.status(400).json({ success: false, message: 'Cannot delete your own admin account' });
+        }
+
+        await Promise.all([
+            Message.deleteMany({ $or: [{ from: user.username }, { to: user.username }] }),
+            User.deleteOne({ _id: id })
+        ]);
+
+        const activeSocket = clients.get(user.username);
+        if (activeSocket) {
+            try { activeSocket.close(4003, 'Account deleted'); } catch (_) {}
+            clients.delete(user.username);
+        }
+        return res.json({ success: true });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Delete failed' });
+        return res.status(500).json({ success: false, message: 'Failed to delete user' });
     }
 });
 
 app.get('/admin/messages', verifyAdminToken, async (req, res) => {
     try {
-        const { from, to } = req.query;
+        const from = typeof req.query.from === 'string' ? req.query.from.trim() : '';
+        const to = typeof req.query.to === 'string' ? req.query.to.trim() : '';
+        const page = sanitizePagination(req.query.page, 1, 100000);
         const limit = sanitizePagination(req.query.limit, 50, 200);
+        const skip = (page - 1) * limit;
+
         const filter = {};
         if (from) filter.from = from;
         if (to) filter.to = to;
-        const messages = await Message.find(filter).sort({ timestamp: -1 }).limit(limit).select('_id from to timestamp').lean();
-        res.json({ success: true, data: { messages: messages.map(m => ({ id: m._id, ...m })) } });
+
+        const [messages, total] = await Promise.all([
+            Message.find(filter)
+                .sort({ timestamp: -1 })
+                .skip(skip)
+                .limit(limit)
+                .select('_id from to timestamp')
+                .lean(),
+            Message.countDocuments(filter)
+        ]);
+
+        const metadata = messages.map((m) => ({
+            id: m._id,
+            from: m.from,
+            to: m.to,
+            timestamp: m.timestamp
+        }));
+
+        return res.json({ success: true, data: { messages: metadata, page, limit, total } });
     } catch (error) {
-        res.status(500).json({ success: false, message: 'Failed to load messages' });
+        return res.status(500).json({ success: false, message: 'Failed to load message metadata' });
     }
 });
 
 app.delete('/admin/messages/:id', verifyAdminToken, async (req, res) => {
     try {
-        await Message.deleteOne({ _id: req.params.id });
-        res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ success: false, message: 'Delete failed' });
-    }
-});
-
-// --- USER API ROUTES ---
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { username, email, password } = req.body;
-        if (!isValidEmail(email)) return res.status(400).json({ success: false, message: 'Invalid email' });
-
-        const safeEmail = email.toLowerCase().trim();
-        const hashedPassword = await bcrypt.hash(password, 12);
-        const user = new User({ username, email: safeEmail, password: hashedPassword });
-        await user.save();
-        res.status(201).json({ success: true, message: 'User registered' });
-    } catch (e) {
-        res.status(400).json({ success: false, message: 'Email already exists' });
-    }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        const safeEmail = typeof email === 'string' ? email.toLowerCase().trim() : '';
-
-        const user = await User.findOne({ email: safeEmail });
-        if (!user || !await bcrypt.compare(password, user.password)) {
-            return res.status(401).json({ success: false, message: 'Invalid credentials' });
+        if (!isValidObjectId(req.params.id)) {
+            return res.status(400).json({ success: false, message: 'Invalid message id' });
         }
-        if (user.isBanned) return res.status(403).json({ success: false, message: 'Banned' });
-        const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET);
-        res.json({ success: true, token, user: { id: user._id, username: user.username, email: user.email } });
-    } catch (e) {
-        res.status(500).json({ success: false, message: 'Server error' });
+        const deleted = await Message.deleteOne({ _id: req.params.id });
+        if (!deleted.deletedCount) {
+            return res.status(404).json({ success: false, message: 'Message not found' });
+        }
+        return res.json({ success: true });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: 'Failed to delete message' });
     }
 });
 
-// --- WEBSOCKET LOGIC ---
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-const clients = new Map();
-const adminMonitors = new Set();
-const connectionLogs = [];
+app.get('/admin/monitor', verifyAdminToken, async (req, res) => {
+    return res.json({
+        success: true,
+        data: {
+            activeUsers: clients.size,
+            connectedUsers: Array.from(clients.keys()),
+            connectionLogs: connectionLogs.slice(-100)
+        }
+    });
+});
 
-function pushConnectionLog(event, userId, extra = {}) {
-    connectionLogs.push({ event, userId, timestamp: Date.now(), ...extra });
-    if (connectionLogs.length > 100) connectionLogs.shift();
-    broadcastMonitorSnapshot();
+app.get('/admin/panel', (req, res) => {
+    return res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
+function detachSocket(ws) {
+    const userId = socketToUserId.get(ws);
+    if (userId) {
+        clients.delete(userId);
+        socketToUserId.delete(ws);
+    }
 }
 
-function broadcastMonitorSnapshot() {
-    const payload = JSON.stringify({
-        type: 'monitor_snapshot',
-        activeConnections: clients.size,
-        connectionLogs: connectionLogs.slice(-50)
-    });
-    adminMonitors.forEach(ws => { if (ws.readyState === WebSocket.OPEN) ws.send(payload); });
+function validateMessage(msg) {
+    if (!msg || typeof msg !== 'object') return false;
+    if (msg.type !== 'message') return false;
+    if (typeof msg.from !== 'string' || msg.from.trim() === '') return false;
+    if (typeof msg.to !== 'string' || msg.to.trim() === '') return false;
+    if (typeof msg.payload !== 'string') return false;
+    return true;
 }
 
 wss.on('connection', async (ws, req) => {
@@ -322,42 +538,152 @@ wss.on('connection', async (ws, req) => {
     if (adminToken) {
         try {
             const payload = jwt.verify(adminToken, ADMIN_JWT_SECRET);
-            if (payload.type !== 'admin') throw new Error();
+            if (payload.type !== 'admin' || payload.role !== 'admin') throw new Error('Invalid admin token');
             ws.isAdminMonitor = true;
+            ws.adminId = payload.adminId;
             adminMonitors.add(ws);
-            broadcastMonitorSnapshot();
+            ws.send(JSON.stringify({
+                type: 'monitor_snapshot',
+                connectedUsers: Array.from(clients.keys()),
+                activeConnections: clients.size,
+                connectionLogs: connectionLogs.slice(-50)
+            }));
             return;
-        } catch (e) { ws.close(4001); return; }
+        } catch (error) {
+            ws.close(4001, 'Unauthorized admin monitor');
+            return;
+        }
     }
 
     try {
-        if (!token) throw new Error();
+        if (!token) throw new Error('No token');
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        const user = await User.findById(decoded.userId).lean();
-        if (!user || user.isBanned) throw new Error();
-        ws.userId = user.username;
-        clients.set(ws.userId, ws);
-        pushConnectionLog('connected', ws.userId);
-    } catch (e) { ws.terminate(); return; }
+        const user = await User.findById(decoded.userId).select('username isBanned').lean();
+        if (!user || user.isBanned) throw new Error('Banned or missing user');
+        ws.tokenUserId = decoded.userId;
+        ws.tokenUsername = user.username;
+        console.log(`WS connected. tokenUserId=${ws.tokenUserId}`);
+    } catch (e) {
+        console.warn('Unauthorized WebSocket connection', e.message);
+        ws.terminate();
+        return;
+    }
 
     ws.on('message', async (data) => {
         try {
-            const msg = JSON.parse(data);
-            if (msg.type === 'message') {
-                const dbMsg = new Message({ from: ws.userId, to: msg.to, payload: msg.payload, timestamp: Date.now() });
-                await dbMsg.save();
-                const target = clients.get(msg.to);
-                if (target && target.readyState === WebSocket.OPEN) {
-                    target.send(JSON.stringify({ type: 'message', from: ws.userId, to: msg.to, payload: msg.payload, timestamp: dbMsg.timestamp }));
+            const msg = JSON.parse(data.toString());
+
+            if (msg.type === 'register') {
+                const userId = typeof msg.userId === 'string' ? msg.userId.trim() : '';
+                if (!userId) {
+                    console.warn('Register failed: missing userId');
+                    return;
                 }
-                pushConnectionLog('message_routed', ws.userId, { to: msg.to });
+                if (userId !== ws.tokenUsername) {
+                    console.warn(`Register failed: userId mismatch token=${ws.tokenUsername} requested=${userId}`);
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'error', payload: 'Invalid userId for token' }));
+                    }
+                    return;
+                }
+
+                const existingSocket = clients.get(userId);
+                if (existingSocket && existingSocket !== ws) {
+                    try {
+                        existingSocket.close(4001, 'Logged in from another session');
+                    } catch (_) {}
+                }
+
+                clients.set(userId, ws);
+                socketToUserId.set(ws, userId);
+                ws.userId = userId;
+                console.log(`${userId} connected (active=${clients.size})`);
+                pushConnectionLog('connected', userId, { active: clients.size });
+                broadcastMonitorSnapshot();
+                ws.send(JSON.stringify({ type: 'registered', userId }));
+                return;
             }
-        } catch (e) {}
+
+            if (!validateMessage(msg)) {
+                console.warn('Invalid message dropped due to schema mismatch');
+                return;
+            }
+
+            const registeredUserId = socketToUserId.get(ws);
+            if (!registeredUserId) {
+                console.warn('Message dropped: socket not registered yet');
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'error', payload: 'Register first' }));
+                }
+                return;
+            }
+
+            const safeFrom = msg.from.trim();
+            const safeTo = msg.to.trim();
+            const timestamp = Number(msg.timestamp) || Date.now();
+
+            if (safeFrom !== registeredUserId) {
+                console.warn(`Message dropped: sender mismatch from=${safeFrom} registered=${registeredUserId}`);
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'error', payload: 'Sender mismatch' }));
+                }
+                return;
+            }
+
+            const dbMessage = new Message({
+                from: safeFrom,
+                to: safeTo,
+                message: msg.payload,
+                timestamp
+            });
+            await dbMessage.save();
+
+            const target = clients.get(safeTo);
+            if (target && target.readyState === WebSocket.OPEN) {
+                target.send(JSON.stringify({
+                    type: 'message',
+                    from: safeFrom,
+                    to: safeTo,
+                    payload: msg.payload,
+                    timestamp
+                }));
+                console.log(`WS route ok from=${safeFrom} to=${safeTo}`);
+                pushConnectionLog('message_routed', safeFrom, { to: safeTo });
+                broadcastMonitorSnapshot();
+            } else {
+                console.warn(`WS route miss from=${safeFrom} to=${safeTo}`);
+                pushConnectionLog('route_miss', safeFrom, { to: safeTo });
+                broadcastMonitorSnapshot();
+            }
+        } catch (e) {
+            console.error("WS Message Error:", e.message);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'error', payload: 'Message processing failed' }));
+            }
+        }
     });
 
     ws.on('close', () => {
-        if (ws.isAdminMonitor) adminMonitors.delete(ws);
-        else { clients.delete(ws.userId); pushConnectionLog('disconnected', ws.userId); }
+        if (ws.isAdminMonitor) {
+            adminMonitors.delete(ws);
+            return;
+        }
+        const closedUserId = socketToUserId.get(ws) || ws.userId || 'unregistered';
+        detachSocket(ws);
+        pushConnectionLog('disconnected', closedUserId, { active: clients.size });
+        broadcastMonitorSnapshot();
+        console.log(`WS closed for userId=${closedUserId}`);
+    });
+
+    ws.on('error', (error) => {
+        if (ws.isAdminMonitor) {
+            adminMonitors.delete(ws);
+            return;
+        }
+        const erroredUserId = socketToUserId.get(ws) || ws.userId || 'unregistered';
+        pushConnectionLog('socket_error', erroredUserId, { message: error.message });
+        broadcastMonitorSnapshot();
+        console.error(`WS error userId=${erroredUserId}:`, error.message);
     });
 });
 
