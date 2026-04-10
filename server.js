@@ -8,7 +8,7 @@ const WebSocket = require('ws');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
-
+app.set('trust proxy', 1);
 const app = express();
 app.use(express.json());
 
