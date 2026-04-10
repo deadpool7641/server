@@ -18,7 +18,7 @@ app.use(express.json());
 
 // --- PHASE 5: SECURITY HARDENING ---
 app.use(helmet({
-    contentSecurityPolicy: false, // Disable CSP for easier admin panel integration if needed, or configure it properly
+    contentSecurityPolicy: false,
 }));
 
 // Serve static files from the 'public' directory
@@ -36,7 +36,7 @@ const ADMIN_TOKEN_TTL = process.env.ADMIN_TOKEN_TTL || '8h';
 
 const adminLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 100, // Increased for admin use
+    max: 100,
     standardHeaders: true,
     legacyHeaders: false,
     message: { success: false, message: 'Too many admin requests' }
@@ -70,7 +70,7 @@ mongoose.connect(process.env.MONGO_URI)
 // --- MONGODB MODELS ---
 const UserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true, trim: true },
-    email: { type: String, required: true, unique: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     password: { type: String, required: true },
     role: { type: String, enum: ['user', 'admin'], default: 'user', index: true },
     isBanned: { type: Boolean, default: false, index: true },
@@ -85,7 +85,7 @@ const User = mongoose.model('User', UserSchema);
 const MessageSchema = new mongoose.Schema({
     from: { type: String, required: true, trim: true },
     to: { type: String, required: true, trim: true },
-    payload: { type: String, required: true }, // renamed to payload to match app logic
+    payload: { type: String, required: true },
     timestamp: { type: Number, required: true }
 }, { versionKey: false });
 MessageSchema.index({ from: 1, to: 1, timestamp: 1 });
@@ -122,7 +122,6 @@ async function verifyAdminToken(req, res, next) {
 
 // --- ADMIN ROUTES ---
 
-// Serve the admin panel
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
@@ -130,7 +129,8 @@ app.get('/admin', (req, res) => {
 app.post('/admin/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        const admin = await User.findOne({ email, role: 'admin' });
+        const safeEmail = typeof email === 'string' ? email.toLowerCase().trim() : '';
+        const admin = await User.findOne({ email: safeEmail, role: 'admin' });
         if (!admin || !await bcrypt.compare(password, admin.password)) {
             return res.status(401).json({ success: false, message: 'Invalid admin credentials' });
         }
@@ -264,8 +264,10 @@ app.post('/api/auth/register', async (req, res) => {
     try {
         const { username, email, password } = req.body;
         if (!isValidEmail(email)) return res.status(400).json({ success: false, message: 'Invalid email' });
+
+        const safeEmail = email.toLowerCase().trim();
         const hashedPassword = await bcrypt.hash(password, 12);
-        const user = new User({ username, email, password: hashedPassword });
+        const user = new User({ username, email: safeEmail, password: hashedPassword });
         await user.save();
         res.status(201).json({ success: true, message: 'User registered' });
     } catch (e) {
@@ -276,7 +278,9 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        const user = await User.findOne({ email });
+        const safeEmail = typeof email === 'string' ? email.toLowerCase().trim() : '';
+
+        const user = await User.findOne({ email: safeEmail });
         if (!user || !await bcrypt.compare(password, user.password)) {
             return res.status(401).json({ success: false, message: 'Invalid credentials' });
         }
