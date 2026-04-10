@@ -119,27 +119,78 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        if (!isValidEmail(email) || !isValidPassword(password)) {
-            return res.status(400).json({ success: false, message: 'Invalid credentials format' });
+
+        // ✅ Basic validation (DO NOT over-validate password)
+        if (!isValidEmail(email) || typeof password !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid input'
+            });
         }
+
         const user = await User.findOne({ email });
-        if (!user || !await bcrypt.compare(password, user.password)) {
-            return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+        // ✅ Prevent null crash
+        if (!user || !user.password) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid credentials'
+            });
         }
+
+        // ✅ Safe bcrypt compare
+        let isMatch = false;
+        try {
+            isMatch = await bcrypt.compare(password, user.password);
+        } catch (err) {
+            console.error("bcrypt error:", err.message);
+            return res.status(500).json({
+                success: false,
+                message: 'Password processing error'
+            });
+        }
+
+        if (!isMatch) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid credentials'
+            });
+        }
+
         if (user.isBanned) {
-            return res.status(403).json({ success: false, message: 'Account is banned' });
+            return res.status(403).json({
+                success: false,
+                message: 'Account is banned'
+            });
         }
+
         user.lastLoginAt = new Date();
         await user.save();
-        const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET);
-        res.json({
+
+        const token = jwt.sign(
+            { userId: user._id, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: '7d' }
+        );
+
+        return res.json({
             success: true,
             message: 'Login successful',
             token,
-            user: { id: user._id, username: user.username, email: user.email, role: user.role }
+            user: {
+                id: user._id,
+                username: user.username,
+                email: user.email,
+                role: user.role
+            }
         });
-    } catch (e) {
-        res.status(500).json({ success: false, message: 'Server error' });
+
+    } catch (err) {
+        console.error("LOGIN ERROR:", err);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
     }
 });
 
@@ -184,29 +235,79 @@ async function verifyAdminToken(req, res, next) {
 app.post('/admin/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        if (!isValidEmail(email) || !isValidPassword(password)) {
-            return res.status(400).json({ success: false, message: 'Invalid credentials format' });
+
+        if (!isValidEmail(email) || typeof password !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid input'
+            });
         }
 
         const admin = await User.findOne({ email, role: 'admin' });
-        if (!admin || !await bcrypt.compare(password, admin.password)) {
-            return res.status(401).json({ success: false, message: 'Invalid admin credentials' });
+
+        if (!admin || !admin.password) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid admin credentials'
+            });
         }
+
+        let isMatch = false;
+        try {
+            isMatch = await bcrypt.compare(password, admin.password);
+        } catch (err) {
+            console.error("bcrypt error:", err.message);
+            return res.status(500).json({
+                success: false,
+                message: 'Password processing error'
+            });
+        }
+
+        if (!isMatch) {
+            return res.status(401).json({
+                success: false,
+                message: 'Invalid admin credentials'
+            });
+        }
+
         if (admin.isBanned) {
-            return res.status(403).json({ success: false, message: 'Admin account is banned' });
+            return res.status(403).json({
+                success: false,
+                message: 'Admin account is banned'
+            });
         }
 
         admin.lastLoginAt = new Date();
         await admin.save();
 
-        const token = signAdminToken(admin);
+        const token = jwt.sign(
+            {
+                adminId: admin._id,
+                role: 'admin',
+                type: 'admin'
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: '8h' }
+        );
+
         return res.json({
             success: true,
+            message: 'Admin login successful',
             token,
-            admin: { id: admin._id, username: admin.username, email: admin.email, role: admin.role }
+            admin: {
+                id: admin._id,
+                username: admin.username,
+                email: admin.email,
+                role: admin.role
+            }
         });
-    } catch (error) {
-        return res.status(500).json({ success: false, message: 'Admin login failed' });
+
+    } catch (err) {
+        console.error("ADMIN LOGIN ERROR:", err);
+        return res.status(500).json({
+            success: false,
+            message: 'Admin login failed'
+        });
     }
 });
 
