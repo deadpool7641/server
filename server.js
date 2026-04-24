@@ -277,6 +277,37 @@ const getConversationMessages = async (req, res) => {
     }
 };
 
+const getAllUserMessages = async (req, res) => {
+    try {
+        const userId = (req.query.userId || '').trim();
+
+        if (!userId) {
+            return res.status(400).json({
+                success: false,
+                message: 'userId is a required query param'
+            });
+        }
+
+        const messages = await Message.find({
+            $or: [
+                { from: userId },
+                { to: userId }
+            ]
+        })
+            .sort({ timestamp: 1 })
+            .select('from to message timestamp -_id')
+            .lean();
+
+        return res.json(messages);
+    } catch (error) {
+        console.error('GET /messages/all failed:', error.message);
+        return res.status(500).json({
+            success: false,
+            message: 'Failed to fetch all user messages'
+        });
+    }
+};
+
 const saveMessage = async (req, res) => {
     try {
         const from = (req.body.from || '').trim();
@@ -304,6 +335,8 @@ const saveMessage = async (req, res) => {
 
 app.get('/messages', getConversationMessages);
 app.get('/api/messages', getConversationMessages);
+app.get('/messages/all', getAllUserMessages);
+app.get('/api/messages/all', getAllUserMessages);
 app.post('/messages', saveMessage);
 app.post('/api/messages', saveMessage);
 
